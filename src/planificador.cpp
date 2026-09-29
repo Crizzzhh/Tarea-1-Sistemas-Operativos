@@ -1,5 +1,11 @@
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
+#include <deque>
 #include <fstream>
 #include <random>
 #include <set>
@@ -10,11 +16,15 @@
 
 using namespace std;
 
+enum Estado { ESPERA, LISTA, EJECUTANDO, TERMINADA, FALLIDA };
+
 struct Nodo {
     string id, nombre;
     long ms = 0;
     vector<int> deps, sucs;
     int pendientes = 0;
+    Estado estado = ESPERA;
+    pid_t pid = -1;
 };
 
 static vector<Nodo> nodos;
@@ -111,17 +121,84 @@ static void parsear(const string& ruta) {
     if (vistos != nodos.size()) error("el plan contiene un ciclo: no es un DAG");
 }
 
+[[noreturn]] static void hijo(const Nodo& n) {
+    printf("  [pid %d] INICIA %s (%s) %ld ms\n", getpid(), n.id.c_str(), n.nombre.c_str(), n.ms);
+    fflush(stdout);
+    struct timespec ts = {n.ms / 1000, (n.ms % 1000) * 1000000L};
+    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
+    _exit(0);
+}
+
+static bool lanzar(int i) {
+    fflush(stdout);
+    pid_t p = fork();
+    if (p < 0) {
+        perror("fork");
+        nodos[i].estado = FALLIDA;
+        return false;
+    }
+    if (p == 0) hijo(nodos[i]);
+    nodos[i].pid = p;
+    nodos[i].estado = EJECUTANDO;
+    return true;
+}
+
 int main(int argc, char** argv) {
     if (argc != 3) {
         fprintf(stderr, "Uso: %s plan.txt K\n", argv[0]);
         return 2;
     }
+    char* fin = nullptr;
+    long K = strtol(argv[2], &fin, 10);
+    if (*fin != '\0' || K < 1) error("K debe ser un entero >= 1");
     parsear(argv[1]);
-    printf("[plan] %zu actividades leidas\n", nodos.size());
-    for (const Nodo& n : nodos) {
-        printf("  %s | %s | %ld ms | deps:", n.id.c_str(), n.nombre.c_str(), n.ms);
-        for (int d : n.deps) printf(" %s", nodos[d].id.c_str());
-        printf("\n");
+    printf("[plan] %zu actividades, K=%ld\n", nodos.size(), K);
+
+    deque<int> listos;
+    unordered_map<pid_t, int> por_pid;
+    for (size_t i = 0; i < nodos.size(); i++)
+        if (nodos[i].pendientes == 0) { nodos[i].estado = LISTA; listos.push_back((int)i); }
+
+    int activos = 0;
+    long n_ok = 0, n_fail = 0;
+    while (!listos.empty() || activos > 0) {
+        while (!listos.empty() && activos < K) {
+            int i = listos.front();
+            listos.pop_front();
+            if (lanzar(i)) {
+                por_pid[nodos[i].pid] = i;
+                activos++;
+            } else {
+                n_fail++;
+            }
+        }
+        if (activos == 0) break;
+
+        int st = 0;
+        pid_t p = waitpid(-1, &st, 0);
+        if (p < 0) {
+            if (errno == EINTR) continue;
+            perror("waitpid");
+            break;
+        }
+        activos--;
+        int i = por_pid[p];
+        if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+            nodos[i].estado = TERMINADA;
+            n_ok++;
+            printf("[plan] %s terminada\n", nodos[i].id.c_str());
+            for (int s : nodos[i].sucs)
+                if (--nodos[s].pendientes == 0) {
+                    nodos[s].estado = LISTA;
+                    listos.push_back(s);
+                }
+        } else {
+            nodos[i].estado = FALLIDA;
+            n_fail++;
+            printf("[plan] %s FALLIDA\n", nodos[i].id.c_str());
+        }
     }
-    return 0;
+
+    printf("\n[resumen] ok=%ld fallidas=%ld\n", n_ok, n_fail);
+    return n_fail ? 1 : 0;
 }
